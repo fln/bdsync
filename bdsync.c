@@ -57,7 +57,12 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <string.h>
-#include <openssl/evp.h>
+#ifdef HAVE_GNUTLS
+	#include <gnutls/gnutls.h>
+	#include <gnutls/crypto.h>
+#else
+	#include <openssl/evp.h>
+#endif
 #include <netdb.h>
 #include <sys/socket.h>
 #include <stdarg.h>
@@ -184,23 +189,38 @@ void verbose (int level, char * format, ...)
 struct cs_state {
     char       *name;
     off64_t    nxtpos;
+#ifdef HAVE_GNUTLS
+    gnutls_hash_hd_t ctx;
+#else
     EVP_MD_CTX *ctx;
+#endif
     int        hashsize;
 };
 
 struct cs_state *init_checksum (const char *checksum)
 {
+#ifdef HAVE_GNUTLS
+    gnutls_digest_algorithm_t md;
+    gnutls_hash_hd_t ctx;
+#else
     const EVP_MD    *md;
     EVP_MD_CTX      *ctx;
+#endif
     int             hs;
     struct cs_state *state;
 
     verbose (2, "init_checksum: checksum: %s\n", checksum);
 
+#ifdef HAVE_GNUTLS
+    md  = gnutls_digest_get_id (checksum);
+    hs  = gnutls_hash_get_len (md);
+    gnutls_hash_init(&ctx, md);
+#else
     md  = EVP_get_digestbyname (checksum);
     hs  = EVP_MD_size (md);
     ctx = EVP_MD_CTX_create();
     EVP_DigestInit_ex (ctx, md, NULL);
+#endif
     if (!md) {
         verbose (0, "Bad checksum %s\n", checksum);
         exit (1);
@@ -254,8 +274,11 @@ int update_checksum (struct cs_state *state, off64_t pos, int fd, off64_t len, u
                           , (long long)nrd, (int)blen);
                 exit (1);
             }
-
+#ifdef HAVE_GNUTLS
+            gnutls_hash(state->ctx, fbuf, blen);
+#else
             EVP_DigestUpdate (state->ctx, fbuf, blen);
+#endif
 
             state->nxtpos += blen;
             len           -= blen;
@@ -274,7 +297,11 @@ int update_checksum (struct cs_state *state, off64_t pos, int fd, off64_t len, u
     verbose (3, "update_checksum: checksum: pos=%lld, len=%d\n"
             , (long long) state->nxtpos, len);
 
+#ifdef HAVE_GNUTLS
+    gnutls_hash(state->ctx, buf, len);
+#else
     EVP_DigestUpdate (state->ctx, buf, len);
+#endif
 
     state->nxtpos += len;
 
@@ -1085,8 +1112,11 @@ const char *get_string (char **msgbuf, size_t *msglen)
 
     return ret;
 };
-
+#ifdef HAVE_GNUTLS
+int parse_digests (char *msgbuf, size_t msglen, int *saltsize, unsigned char **salt, gnutls_digest_algorithm_t *dg_md, struct cs_state **cs_state)
+#else
 int parse_digests (char *msgbuf, size_t msglen, int *saltsize, unsigned char **salt, const EVP_MD **dg_md, struct cs_state **cs_state)
+#endif
 {
     char       *tmp;
     const char *digest, *checksum;
@@ -1118,7 +1148,11 @@ int parse_digests (char *msgbuf, size_t msglen, int *saltsize, unsigned char **s
         exit (1);
     }
 
+#ifdef HAVE_GNUTLS
+    *dg_md = gnutls_digest_get_id (digest);
+#else
     *dg_md = EVP_get_digestbyname (digest);
+#endif
 
     if (!*dg_md) {
         verbose (0, "parse_digests: bad digest %s\n", digest);
@@ -1282,9 +1316,12 @@ int flush_checksum (struct cs_state **state, size_t *len, unsigned char **buf)
     if (*state) {
         *len = (*state)->hashsize;
         *buf = malloc (*len);
-
+#ifdef HAVE_GNUTLS
+        gnutls_hash_deinit((*state)->ctx, *buf);
+#else
         EVP_DigestFinal_ex ((*state)->ctx, *buf, NULL);
         EVP_MD_CTX_destroy ((*state)->ctx);
+#endif
 
         {
             char *tmp = bytes2str (*len, *buf);
@@ -1304,7 +1341,11 @@ int flush_checksum (struct cs_state **state, size_t *len, unsigned char **buf)
     return 0;
 }
 
+#ifdef HAVE_GNUTLS
+int gen_hashes ( const gnutls_digest_algorithm_t md
+#else
 int gen_hashes ( const EVP_MD *md
+#endif
                , struct cs_state *cs_state
                , struct rd_queue *prd_queue, struct wr_queue *pwr_queue
                , int saltsize, unsigned char *salt
@@ -1314,8 +1355,13 @@ int gen_hashes ( const EVP_MD *md
 {
     unsigned char *buf, *fbuf;
     off64_t       nrd, lenend;
+#ifdef HAVE_GNUTLS
+    int              hashsize = gnutls_hash_get_len (md);
+    gnutls_hash_hd_t dg_ctx;
+#else
     int           hashsize = EVP_MD_size (md);
     EVP_MD_CTX    *dg_ctx;
+#endif
 
     *retsiz = nstep * hashsize;
     buf     = malloc (nstep * hashsize);
@@ -1339,12 +1385,19 @@ int gen_hashes ( const EVP_MD *md
         posix_fadvise64 (fd, start + step, RDAHEAD, POSIX_FADV_WILLNEED);
 */
 
+#ifdef HAVE_GNUTLS
+        gnutls_hash_init(&dg_ctx, md);
+        gnutls_hash (dg_ctx, salt, saltsize);
+        gnutls_hash (dg_ctx, fbuf, nrd);
+        gnutls_hash_deinit (dg_ctx, buf);
+#else
         dg_ctx = EVP_MD_CTX_create();
         EVP_DigestInit_ex (dg_ctx, md, NULL);
         EVP_DigestUpdate (dg_ctx, salt, saltsize);
         EVP_DigestUpdate (dg_ctx, fbuf, nrd);
         EVP_DigestFinal_ex (dg_ctx, buf, NULL);
         EVP_MD_CTX_destroy (dg_ctx);
+#endif
 
         update_checksum (cs_state, start, fd, step, fbuf, devsize);
 
@@ -1389,7 +1442,11 @@ int do_server (void)
     size_t          len;
     struct          wr_queue wr_queue;
     struct          rd_queue rd_queue;
+#ifdef HAVE_GNUTLS
+    gnutls_digest_algorithm_t dg_md = 0;
+#else
     const EVP_MD    *dg_md = NULL;
+#endif
     struct cs_state *cs_state;
 
     init_wr_queue (&wr_queue, STDOUT_FILENO);
@@ -1522,7 +1579,11 @@ int write_block (off64_t pos, unsigned short len, char *pblock)
     return 0;
 }
 
+#ifdef HAVE_GNUTLS
+int hashmatch ( const gnutls_digest_algorithm_t md
+#else
 int hashmatch ( const EVP_MD *md
+#endif
               , struct cs_state *cs_state
               , int remdata
               , int saltsize, unsigned char *salt
@@ -1550,7 +1611,11 @@ int hashmatch ( const EVP_MD *md
 
     mdevsize = (rdevsize > ldevsize ? rdevsize : ldevsize);
 
+#ifdef HAVE_GNUTLS
+    hashsize = gnutls_hash_get_len (md);
+#else
     hashsize = EVP_MD_size (md);
+#endif
 
     while (   (hashstart < hashend)
            || ((recurs == 0) && ((*hashreqs != 0) || (*blockreqs != 0)))) {
@@ -1677,22 +1742,35 @@ int do_client (char *digest, char *checksum, char *command, char *ldev, char *rd
     struct          wr_queue wr_queue;
     struct          rd_queue rd_queue;
     int             hashsize;
+#ifdef HAVE_GNUTLS
+    gnutls_digest_algorithm_t dg_md;
+#else
     const EVP_MD    *dg_md;
+#endif
     struct cs_state *cs_state;
 
+#ifdef HAVE_GNUTLS
+    dg_md = gnutls_digest_get_id (digest);
+#else
     dg_md = EVP_get_digestbyname (digest);
+#endif
     if (!dg_md) {
         fprintf (stderr, "Bad hash %s\n", digest);
         exit (1);
     }
 
+    fprintf (stderr, "Checksum %s, remdata %d\n", checksum, remdata);
     if (checksum && !remdata) {
         cs_state = init_checksum (checksum);
     } else {
         cs_state = NULL;
     }
 
+#ifdef HAVE_GNUTLS
+    hashsize = gnutls_hash_get_len (dg_md);
+#else
     hashsize = EVP_MD_size (dg_md);
+#endif
 
     init_salt (sizeof (salt), salt, fixedsalt);
 
@@ -1956,7 +2034,11 @@ int main (int argc, char *argv[])
     char    *checksum = NULL;
     char    *cp;
 
+#ifdef HAVE_GNUTLS
+    gnutls_global_init();
+#else
     OpenSSL_add_all_digests ();
+#endif
 
     for (;;) {
         int option_index = 0;
@@ -2033,30 +2115,37 @@ int main (int argc, char *argv[])
         }
     }
 
-    if (ispatch) {
-        if (optind != argc) {
-            verbose (0, "Bad number of arguments %d\n", argc - optind);
-            return 1;
+    {
+        int rc;
+        if (ispatch) {
+            if (optind != argc) {
+                verbose (0, "Bad number of arguments %d\n", argc - optind);
+                return 1;
+            }
+            rc = do_patch (patchdev, diffsize);
+        } else if (isserver) {
+            vhandler = verbose_syslog;
+            if (optind != argc) {
+                verbose (0, "Bad number of arguments %d\n", argc - optind);
+                return 1;
+            }
+            rc = do_server ();
+        } else {
+            // client
+            if (optind != argc - 3) {
+                verbose (0, "Bad number of arguments %d\n", argc - optind);
+                return 1;
+            }
+
+            if (!hash) hash = "md5";
+
+            rc = do_client (hash, checksum, argv[optind], argv[optind + 1],argv[optind + 2], hlarge, hsmall, remdata, fixedsalt, diffsize);
         }
-        return do_patch (patchdev, diffsize);
+#ifdef HAVE_GNUTLS
+        gnutls_global_deinit();
+#else
+	EVP_cleanup();
+#endif
+        return rc;
     }
-
-    if (isserver) {
-        vhandler = verbose_syslog;
-        if (optind != argc) {
-            verbose (0, "Bad number of arguments %d\n", argc - optind);
-            return 1;
-        }
-        return do_server ();
-    }
-
-    // client
-    if (optind != argc - 3) {
-        verbose (0, "Bad number of arguments %d\n", argc - optind);
-        return 1;
-    }
-
-    if (!hash) hash = "md5";
-
-    return do_client (hash, checksum, argv[optind], argv[optind + 1],argv[optind + 2], hlarge, hsmall, remdata, fixedsalt, diffsize);
 }
